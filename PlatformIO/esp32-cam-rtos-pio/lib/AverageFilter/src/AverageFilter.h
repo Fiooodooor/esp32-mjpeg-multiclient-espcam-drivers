@@ -36,8 +36,9 @@ class averageFilter {
 
 template<typename T>
 averageFilter<T>::averageFilter(int aSamples) {
-    iSamples = constrain(aSamples, 1, aSamples); 
-    iReadings = (T *) malloc (sizeof (T) * aSamples);
+    iSamples = aSamples<1?1:aSamples;
+    // iReadings = (T *) malloc (sizeof (T) * iSamples);
+    iReadings = new T(iSamples);
 // if there is a memory allocation error.
    if (iReadings == NULL) {
     iReadings = &iCV;
@@ -48,7 +49,7 @@ averageFilter<T>::averageFilter(int aSamples) {
 
 template<typename T>
 averageFilter<T>::averageFilter(int aSamples, T* aStorage) {
-    iSamples = constrain(aSamples, 1, aSamples); 
+    iSamples = aSamples<1?1:aSamples;
     iReadings = aStorage;
 // if storage provided is NULL
    if (iReadings == NULL) {
@@ -60,7 +61,7 @@ averageFilter<T>::averageFilter(int aSamples, T* aStorage) {
 
 template<typename T>
 void averageFilter<T>::setSamples(int aSamples) {
-    iSamples = constrain(aSamples, 1, aSamples); 
+    iSamples = aSamples<1?1:aSamples;
     if ( iCount ) initialize();
 }
 
@@ -85,13 +86,14 @@ void averageFilter<T>::initialize() {
 template<typename T>
 T   averageFilter<T>::value(T aSample) {
     // if ( !iReadings ) return 0;
-    iTotal -= iReadings[iIndex];
-    iReadings[iIndex] = aSample;
-    iTotal += aSample;
-    if (++iIndex >= iSamples) iIndex = 0;
-    if (++iCount > iSamples) iCount = iSamples;
-    iCV = (T) iTotal/iCount;
+    if(std::isfinite(aSample)) {
+      iTotal += (aSample-iReadings[iIndex]);
+      iReadings[iIndex] = aSample;
+      if (++iIndex >= iSamples) iIndex = 0;
+      if (++iCount > iSamples) iCount = iSamples;
+      iCV = (T) iTotal/iCount;
+    }
     return iCV;
 }
-
+// FLT_MAX
 #endif  // _AVERAGEFILTER_H

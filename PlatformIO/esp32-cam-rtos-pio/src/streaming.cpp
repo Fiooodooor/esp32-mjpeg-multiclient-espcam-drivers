@@ -22,7 +22,7 @@ void mjpegCB(void* pvParameters) {
   // Creating frame synchronization semaphore and initializing it
   frameSync = xSemaphoreCreateBinary();
   xSemaphoreGive( frameSync );
-
+  
 
   //  Creating RTOS task for grabbing frames from the camera
   xTaskCreatePinnedToCore(

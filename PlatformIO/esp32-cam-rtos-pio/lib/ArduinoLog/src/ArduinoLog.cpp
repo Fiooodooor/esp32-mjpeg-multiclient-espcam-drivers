@@ -148,16 +148,16 @@ void Logging::printFormat(const char format, va_list *args) {
 #if !defined(ESP8266)
   else if (format == 'S')
   {
-    String s = (String)va_arg(*args, String);
+    const char *s = (const char *)va_arg(*args, const char *);
     _logOutput->print(s);
   }
-  else if (format == 'I')
-  {
-    char s[16];
-    IPAddress ip = (IPAddress)va_arg(*args, IPAddress );
-    sprintf(s, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-    _logOutput->print(s);
-  }
+  // else if (format == 'I')
+  // {
+  //   char s[16];
+  //   uint8_t ip[4] = (uint8_t [4])va_arg(*args, uint8_t [4]);
+  //   sprintf(s, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  //   _logOutput->print(s);
+  // }
 #endif
   else if (format == 'P')
   {

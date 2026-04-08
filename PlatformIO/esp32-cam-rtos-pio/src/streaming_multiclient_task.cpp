@@ -180,14 +180,14 @@ void streamCB(void * pvParameters) {
   averageFilter<int32_t> streamAvg(10);
   averageFilter<int32_t> waitAvg(10);
   averageFilter<uint32_t> frameAvg(10);
-  averageFilter<float> fpsAvg(10);
+  averageFilter<uint32_t> fpsAvg(10);
   uint32_t streamStart = 0;
   streamAvg.initialize();
   waitAvg.initialize();
   frameAvg.initialize();
   fpsAvg.initialize();
-  uint32_t lastPrint = millis();
-  uint32_t lastFrame = millis();
+  unsigned long lastPrint = millis();
+  unsigned long lastFrame = millis();
 #endif
 
   for (;;) {
@@ -276,12 +276,11 @@ void streamCB(void * pvParameters) {
     if ( xTaskDelayUntil(&xLastWakeTime, xFrequency) != pdTRUE ) taskYIELD();
 
 #if defined (BENCHMARK)
-    fpsAvg.value(1000.0 / (float) (millis()-lastFrame) );
+    fpsAvg.value((uint32_t) (millis()-lastFrame) );
     lastFrame = millis();
-
     if ( millis() - lastPrint > BENCHMARK_PRINT_INT ) {
       lastPrint = millis();
-      Log.verbose("streamCB: wait avg=%d, stream avg=%d us, frame avg size=%d bytes, fps=%S\n", waitAvg.currentValue(), streamAvg.currentValue(), frameAvg.currentValue(), String(fpsAvg.currentValue()));
+      Log.verbose("streamCB: wait avg=%d, stream avg=%d us, frame avg size=%d bytes, fps=%S\n", waitAvg.currentValue(), streamAvg.currentValue(), frameAvg.currentValue(), String((float)(1000.0) / (float)(fpsAvg.currentValue())));
     }
 #endif
   }
