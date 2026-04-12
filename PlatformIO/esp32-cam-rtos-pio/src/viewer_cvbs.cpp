@@ -2,8 +2,8 @@
  * ESP32 MJPEG Viewer — CVBS Composite Video Output
  *
  * Core 0: WiFi download (PS off, bulk header parse, taskYIELD I/O)
- * Core 1: JPEG decode → CVBS 240x160 via DAC (GPIO25/26)
- * Single-buffered JPEG in DRAM, producer-consumer queues
+ * Core 1: JPEG decode → CVBS output scaled to 480x320 via DAC (GPIO25/26)
+ * Double-buffered MJPEG download with a 1/4-sized CVBS canvas memory footprint.
  *
  * Serial: SET host:port/path | STATUS | RESET
  */
@@ -15,6 +15,7 @@
 #include <freertos/queue.h>
 #include <Preferences.h>
 #include <esp_wifi.h>
+#include <esp_heap_caps.h>
 #include "viewer_cvbs_config.h"
 
 // ---- Build-time defaults (override via -D flags) ----
@@ -36,9 +37,9 @@
 
 // ---- Constants ----
 enum : uint32_t {
-    MAX_JPEG_BUF   = 64 * 1024,
-    NUM_BUFS       = 1,
-    DL_STACK       = 8 * 1024,
+    MAX_JPEG_BUF   = 24 * 1024,
+    NUM_BUFS       = 2,
+    DL_STACK       = 16 * 1024,
     CONN_TIMEOUT   = 5000,
     READ_TIMEOUT   = 10000,
     BACKOFF_INIT   = 500,
@@ -47,13 +48,8 @@ enum : uint32_t {
     STATS_INTERVAL = 3000,
     FRAME_TIMEOUT  = 5000,
     HDR_BUF        = 512,
-    W = 240, H = 160,
-};
-
-// ---- Frame descriptor for queue-based single buffer ----
-struct FrameDesc {
-    uint8_t* buf;
-    size_t   len;
+    W = CFG_PANEL_WIDTH,
+    H = CFG_PANEL_HEIGHT,
 };
 
 // ---- Connection state machine ----
@@ -67,13 +63,23 @@ static const uint16_t ST_CLR[] = {
     TFT_RED, TFT_YELLOW, TFT_RED, TFT_YELLOW, TFT_GREEN
 };
 
+// ---- Frame descriptor for queue-based single buffer ----
+struct FrameDesc {
+    uint8_t* buf;
+    size_t   len;
+};
+
 // ---- Globals ----
-static LGFX     tft;
-static JPEGDEC  jpeg;
-static PerfTracker perf;
-static Preferences prefs;
+static LGFX            tft;
+static JPEGDEC         jpeg;
+static PerfTracker     perf;
+static Preferences     prefs;
+static WiFiClient      cli;
+TaskHandle_t dlTaskHandle = NULL;
 
 static uint8_t* jpegBuf[NUM_BUFS];
+// static uint8_t jpegBuf[NUM_BUFS][MAX_JPEG_BUF];
+
 static volatile size_t frameSize;
 
 // Triple-buffer queues
@@ -89,13 +95,13 @@ static volatile int8_t    rssi       = 0;
 static volatile bool      osdOn      = true;
 static uint32_t           bootTime   = 0;
 
-static char     cfgHost[64];
+static char     cfgHost[32];
+static char     cfgPath[32];
 static uint16_t cfgPort = 80;
-static char     cfgPath[64];
 
-// ---- JPEG decode callback — direct pushImage (CVBS is framebuffer-based) ----
+// ---- JPEG decode callback — direct CVBS framebuffer update ----
 static int onJpegDraw(JPEGDRAW* d) {
-    tft.pushImage(d->x, d->y, d->iWidth, d->iHeight, (lgfx::swap565_t*)d->pPixels);
+    tft.pushImageDMA(d->x, d->y, d->iWidth, d->iHeight, (lgfx::swap565_t*)d->pPixels);
     return 1;
 }
 
@@ -180,7 +186,6 @@ static void ensureWiFi() {
 
 // ---- Download task (Core 0) ----
 static void dlTask(void*) {
-    WiFiClient cli;
     cli.setNoDelay(true);
     cli.setTimeout(READ_TIMEOUT / 1000);
     uint32_t bo = BACKOFF_INIT;
@@ -238,35 +243,35 @@ static void dlTask(void*) {
     }
 }
 
+static void printMemInfo() {
+    Serial.printf("PSRAM=%u HeapInt=%u HInt_max=%u HeapDef=%u HDef_max=%u\n", ESP.getFreePsram(), heap_caps_get_free_size(MALLOC_CAP_INTERNAL), heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+    heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+}
+
 // ---- OSD ----
 static void drawOSD() {
     if (!osdOn) return;
-    tft.fillRect(0, H - 16, W, 16, TFT_BLACK);
+    // tft.fillRect(0, H - 16, W, 16, TFT_BLACK);
     tft.setTextSize(1);
-    tft.setTextDatum(bottom_left);
+    tft.setTextDatum(top_left);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.setCursor(2, H - 2);
-    tft.printf("%.1ffps %uKB dec:%.0fms", perf.fps, (unsigned)(frameSize/1024), perf.decodeMs);
-
-    tft.setTextDatum(bottom_center);
+    tft.setCursor(0, 2);
+    tft.printf("%.1ffps", perf.fps);
+    tft.setTextSize(1);
+    tft.setTextDatum(top_right);
     tft.setTextColor(ST_CLR[connSt], TFT_BLACK);
-    tft.drawString(ST_STR[connSt], W / 2, H - 2);
-
-    tft.setTextDatum(bottom_right);
-    tft.setTextColor(rssi > -60 ? TFT_GREEN : (rssi > -75 ? TFT_YELLOW : TFT_RED), TFT_BLACK);
-    tft.setCursor(W - 2, H - 2);
-    uint32_t up = (millis() - bootTime) / 1000;
-    tft.printf("R:%d fr:%u %02u:%02u", rssi, (unsigned)totFrames, up / 60, up % 60);
+    tft.setCursor(W/2, 2);
+    tft.printf("%s", ST_STR[connSt]);
 }
 
-static void drawSplash(const char* msg, uint16_t clr) {
+static void drawSplash(const char* msg, uint16_t title_clr, uint16_t msg_clr = TFT_WHITE) {
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(middle_center);
-    tft.setTextColor(clr, TFT_BLACK);
+    tft.setTextColor(title_clr, TFT_BLACK);
     tft.setTextSize(2);
     tft.drawString("MJPEG Viewer", W / 2, H / 2 - 30);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(msg_clr, TFT_BLACK);
     tft.drawString(msg, W / 2, H / 2 + 5);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     char u[96]; snprintf(u, sizeof(u), "%s:%d%s", cfgHost, cfgPort, cfgPath);
@@ -346,39 +351,42 @@ void setup() {
     delay(300);
     bootTime = millis();
     Serial.println("\n=== ESP32 MJPEG Viewer (CVBS) ===");
-    Serial.printf("Heap: %u  PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    printMemInfo();
 
     cfgLoad();
     Serial.printf("Target: %s:%d%s\n", cfgHost, cfgPort, cfgPath);
 
+    // JPEG buffers for producer/consumer download + decode
+    for (int i = 0; i < NUM_BUFS; i++) {
+        jpegBuf[i] = (uint8_t*)heap_caps_malloc(MAX_JPEG_BUF, MALLOC_CAP_DEFAULT);
+        if (!jpegBuf[i]) {
+            jpegBuf[i] = (uint8_t*)heap_caps_malloc(MAX_JPEG_BUF, MALLOC_CAP_INTERNAL);
+        }
+    }
+    tft.setColorDepth(16);
     tft.init();
     tft.fillScreen(TFT_BLACK);
-    tft.setSwapBytes(true);
-    drawSplash("Connecting WiFi...", TFT_CYAN);
+    tft.setSwapBytes(false);
 
-    // DRAM single buffer
-    for (int i = 0; i < NUM_BUFS; i++) {
-        jpegBuf[i] = (uint8_t*)malloc(MAX_JPEG_BUF);
+    for (int i = 0; i < NUM_BUFS; i++)
+    {
         if (!jpegBuf[i]) {
             Serial.printf("FATAL: DRAM alloc failed (%u bytes)\n", MAX_JPEG_BUF);
-            drawSplash("MEMORY FAILED", TFT_RED);
+            drawSplash("MEMORY FAILED", TFT_RED, TFT_RED);
+            printMemInfo();
             for (;;) vTaskDelay(1000);
         }
     }
 
-    freeQ  = xQueueCreate(NUM_BUFS, sizeof(FrameDesc));
-    readyQ = xQueueCreate(NUM_BUFS, sizeof(FrameDesc));
-    for (int i = 0; i < NUM_BUFS; i++) {
-        FrameDesc fd = { jpegBuf[i], 0 };
-        xQueueSend(freeQ, &fd, 0);
-    }
-
-    // WiFi
+    drawSplash("Connecting WiFi...", TFT_CYAN, TFT_WHITE);
     connSt = S_WIFI_UP;
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(VIEWER_WIFI_SSID, VIEWER_WIFI_PASS);
     for (int i = 0; i < 150 && WiFi.status() != WL_CONNECTED; i++) delay(100);
+
+    Serial.printf("Target frame: %ux%u\n", W, H);
+    printMemInfo();
 
     if (WiFi.status() == WL_CONNECTED) {
         esp_wifi_set_ps(WIFI_PS_NONE);
@@ -392,9 +400,30 @@ void setup() {
         drawSplash("WiFi retry...", TFT_YELLOW);
     }
 
-    esp_task_wdt_init(WDT_TIMEOUT_SEC, false);
-    xTaskCreatePinnedToCore(dlTask, "dl", DL_STACK, nullptr, 3, nullptr, 0);
-    Serial.println("Ready. Commands: SET host:port/path | STATUS | RESET");
+    freeQ  = xQueueCreate(NUM_BUFS, sizeof(FrameDesc));
+    readyQ = xQueueCreate(NUM_BUFS, sizeof(FrameDesc));
+    for (int i = 0; i < NUM_BUFS; i++) {
+        FrameDesc fd = { jpegBuf[i], 0 };
+        xQueueSend(freeQ, &fd, 0);
+    }
+
+    if(esp_task_wdt_init(WDT_TIMEOUT_SEC, false) == ESP_OK) {
+        printMemInfo();
+        Serial.println("esp_task_wdt_init ESP_OK. Starting download task...");
+        BaseType_t xReturned = xTaskCreatePinnedToCore(dlTask, "dl", DL_STACK, nullptr, 3, &dlTaskHandle, 0);
+        if(xReturned == pdPASS) {
+            Serial.println("xTaskCreatePinnedToCore pdPASS. Commands: SET host:port/path | STATUS | RESET");
+        } else {
+            Serial.printf("Failed to start download task. (code = %ld)\n", (long)xReturned);
+            printMemInfo();
+            drawSplash("DL Task Failed", TFT_RED);
+            for (;;) vTaskDelay(1000);
+        }
+    } else {
+        Serial.println("Failed to initialize WDT");
+        drawSplash("WDT Failed", TFT_RED);
+        for (;;) vTaskDelay(1000);
+    }
 }
 
 // ---- Main loop: decode & display (Core 1) ----
@@ -406,30 +435,24 @@ void loop() {
         frameSize = fd.len;
         uint32_t t0 = micros();
         if (jpeg.openRAM(fd.buf, fd.len, onJpegDraw)) {
+            tft.startWrite();
             jpeg.setPixelType(RGB565_BIG_ENDIAN);
-            jpeg.decode(0, 0, 0);
+            int opts = JPEG_SCALE_HALF;
+            if (jpeg.getWidth() >= W * 2 && jpeg.getHeight() >= H * 2) {
+                opts = JPEG_SCALE_HALF;
+            }
+            jpeg.decode(0, 0, opts);
+            drawOSD();
+            tft.endWrite();
             jpeg.close();
         }
         perf.frameDone(micros() - t0);
         xQueueSend(freeQ, &fd, 0);
 
-        static uint8_t fpsSkip = 0;
-        if (osdOn && ++fpsSkip >= 4) {
-            fpsSkip = 0;
-            tft.setTextDatum(top_left); tft.setTextSize(1);
-            tft.setTextColor(TFT_GREEN, TFT_BLACK);
-            tft.setCursor(2, 2);
-            tft.printf("%.1ffps %uKB", perf.fps, (unsigned)(frameSize / 1024));
-        }
-        static uint32_t lastOSD = 0;
-        if (osdOn && millis() - lastOSD > OSD_INTERVAL) { drawOSD(); lastOSD = millis(); }
-
         static uint32_t lastLog = 0;
         if (millis() - lastLog > STATS_INTERVAL) {
-            Serial.printf("[D] %.1ffps fr=%u e=%u dec=%u-%u-%ums heap=%u\n",
-                perf.fps, totFrames, totErrors,
-                (unsigned)perf.minDecode, (unsigned)perf.decodeMs, (unsigned)perf.maxDecode,
-                ESP.getFreeHeap());
+            Serial.printf("[D] %.1ffps fr=%u e=%u dec=%u-%u-%ums heap=%u fsize=%u \n", perf.fps, totFrames, totErrors, (unsigned)perf.minDecode, (unsigned)perf.decodeMs, (unsigned)perf.maxDecode, ESP.getFreeHeap(), heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+            printMemInfo();
             lastLog = millis();
         }
     } else {

@@ -10,6 +10,14 @@
 #include <lgfx/v1/platforms/esp32/Panel_CVBS.hpp>
 
 #define WDT_TIMEOUT_SEC 15
+#define CFG_PANEL_WIDTH 270
+#define CFG_PANEL_HEIGHT 180
+// 240*160=38400
+// 270*180=48600
+// 285*190=54150
+// 300*200=60000
+// 375*250=93750
+// 405*270=109350
 
 // ---- Performance tracker: FPS + decode time ----
 struct PerfTracker {
@@ -39,14 +47,15 @@ class LGFX : public lgfx::LGFX_Device {
     lgfx::Panel_CVBS _panel_instance;
 public:
     LGFX() {
-        { // Panel resolution
+        {
             auto cfg = _panel_instance.config();
-            cfg.memory_width  = 240;
-            cfg.memory_height = 160;
-            cfg.panel_width   = 240;
-            cfg.panel_height  = 160;
+            cfg.memory_width  = CFG_PANEL_WIDTH;
+            cfg.memory_height = CFG_PANEL_HEIGHT;
+            cfg.panel_width   = CFG_PANEL_WIDTH;
+            cfg.panel_height  = CFG_PANEL_HEIGHT;
             cfg.offset_x      = 0;
             cfg.offset_y      = 0;
+            cfg.offset_rotation = 0;
             _panel_instance.config(cfg);
         }
         { // Signal + DAC settings
