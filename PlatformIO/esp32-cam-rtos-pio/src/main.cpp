@@ -1,4 +1,4 @@
-
+#define FLIP_VERTICALLY 1
 #include <Arduino.h>
 #include "definitions.h"
 #include "references.h"
@@ -130,5 +130,5 @@ void setup() {
 void loop() {
   tft.pollSerial();
   tft.frameReceiveTask();
-  
+
 }
