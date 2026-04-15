@@ -13,6 +13,7 @@ uint32_t lastPrintCam = millis();
 #endif
 
 void camCB(void* pvParameters) {
+  FrameDesc fd;
   TickType_t xLastWakeTime;
   const TickType_t xFrequency = pdMS_TO_TICKS(1000 / FPS);
   char* fbs[2] = { NULL, NULL };
@@ -33,53 +34,66 @@ void camCB(void* pvParameters) {
 #endif
 
     s = 0;
-    fb = esp_camera_fb_get();
-    if ( fb ) {
-      s = fb->len;
+    if (xQueueReceive(freeQ, &fd, pdMS_TO_TICKS(5000U)) == pdTRUE) {
 
-      //  If frame size is more that we have previously allocated - request  125% of the current frame space
-      if (s > fSize[ifb]) {
-        fSize[ifb] = s + s/4;
-        fbs[ifb] = allocateMemory(fbs[ifb], fSize[ifb], FAIL_IF_OOM, ANY_MEMORY);
+      fb = esp_camera_fb_get();
+      if (fb) {
+        s = fb->len;
+        char* fb_ptr = (char *)fb->buf;
+
+        if (fb->len > fSize[ifb]) {
+          fSize[ifb] = fb->len + fb->len/4;
+          fbs[ifb] = allocateMemory(fbs[ifb], fSize[ifb], FAIL_IF_OOM, ANY_MEMORY);
+        }
+        memcpy(fbs[ifb], fb_ptr, fb->len);
+        if (fd.buf) {
+          memcpy(fd.buf, fb_ptr, fb->len);
+          fd.len = fb->len;
+        }
+        esp_camera_fb_return(fb);
+        if (xQueueSend(readyQ, &fd, 0) != pdTRUE) {
+          // Queue full — drop this frame, return buffer
+          xQueueSend(freeQ, &fd, 0);          
+        }
       }
-
-      //  Copy current frame into local buffer
-      char* b = (char *)fb->buf;
-      memcpy(fbs[ifb], b, s);
-      esp_camera_fb_return(fb);
-    }
-    else {
-      Log.error("camCB: error capturing image for frame %d\n", frameNumber);
-      vTaskDelay(10);
-    }
+      else {
+        Log.error("camCB: error capturing image for frame %d\n", frameNumber);
+        vTaskDelay(10);
+      }
 
 #if defined(BENCHMARK)
     captureAvg.value(micros()-benchmarkStart);
 #endif
 
-    //  Only switch frames around if no frame is currently being streamed to a client
-    //  Wait on a semaphore until client operation completes
-    //    xSemaphoreTake( frameSync, portMAX_DELAY );
+      if ( xSemaphoreTake( frameSync, portMAX_DELAY ) ) {
+        camBuf = fbs[ifb];
+        camSize = s;
+        ifb++;
+        ifb &= 1;
+        frameNumber++;
+        xSemaphoreGive( frameSync );
+      }
 
-    if ( xSemaphoreTake( frameSync, portMAX_DELAY ) ) {
-      camBuf = fbs[ifb];
-      camSize = s;
-      ifb++;
-      ifb &= 1;  // this should produce 1, 0, 1, 0, 1 ... sequence
-      frameNumber++;
-      //  Let anyone waiting for a frame know that the frame is ready
-      xSemaphoreGive( frameSync );
-    }
+      if ( xTaskDelayUntil(&xLastWakeTime, xFrequency) != pdTRUE ) taskYIELD();
 
-    //  Let other (streaming) tasks run
-    if ( xTaskDelayUntil(&xLastWakeTime, xFrequency) != pdTRUE ) taskYIELD();
-
-    if ( noActiveClients == 0 ) {
-      Log.verbose("mjpegCB: free heap           : %d\n", ESP.getFreeHeap());
-      Log.verbose("mjpegCB: min free heap)      : %d\n", ESP.getMinFreeHeap());
-      Log.verbose("mjpegCB: max alloc free heap : %d\n", ESP.getMaxAllocHeap());
-      Log.verbose("mjpegCB: tCam stack wtrmark  : %d\n", uxTaskGetStackHighWaterMark(tCam));
-      vTaskSuspend(NULL);  // passing NULL means "suspend yourself"
+#if defined(LOCAL_CAMERA_PREVIEW)
+      // When TFT preview is active, never suspend — the display needs
+      // continuous frames even when no WiFi clients are connected.
+      if ( noActiveClients == 0 ) {
+        Log.verbose("mjpegCB: free heap           : %d\n", ESP.getFreeHeap());
+        Log.verbose("mjpegCB: min free heap)      : %d\n", ESP.getMinFreeHeap());
+        Log.verbose("mjpegCB: max alloc free heap : %d\n", ESP.getMaxAllocHeap());
+        Log.verbose("mjpegCB: tCam stack wtrmark  : %d\n", uxTaskGetStackHighWaterMark(tCam));
+      }
+#else
+      if ( noActiveClients == 0 ) {
+        Log.verbose("mjpegCB: free heap           : %d\n", ESP.getFreeHeap());
+        Log.verbose("mjpegCB: min free heap)      : %d\n", ESP.getMinFreeHeap());
+        Log.verbose("mjpegCB: max alloc free heap : %d\n", ESP.getMaxAllocHeap());
+        Log.verbose("mjpegCB: tCam stack wtrmark  : %d\n", uxTaskGetStackHighWaterMark(tCam));
+        vTaskSuspend(NULL);  // passing NULL means "suspend yourself"
+      }
+#endif
     }
 #if defined(BENCHMARK)
     if ( millis() - lastPrintCam > BENCHMARK_PRINT_INT ) {
@@ -176,7 +190,6 @@ void streamCB(void * pvParameters) {
 #endif
 
   for (;;) {
-    //  Only send anything if there is someone watching
     if ( info->client->connected() ) {
 
       if ( info->frame != frameNumber) { // do not send same frame twice
@@ -194,36 +207,6 @@ void streamCB(void * pvParameters) {
         streamStart = micros();
 #endif
 
-
-//  ======================== OPTION1 ==================================
-//  server a copy of the buffer - overhead: have to allocate and copy a buffer for all frames
-
-// /*
-        // if ( info->buffer == NULL ) {
-        //   info->buffer = allocateMemory (info->buffer, camSize, FAIL_IF_OOM, ANY_MEMORY);
-        //   info->len = camSize;
-        // }
-        // else {
-        //   if ( camSize > info->len ) {
-        //     info->buffer = allocateMemory (info->buffer, camSize, FAIL_IF_OOM, ANY_MEMORY);
-        //     info->len = camSize;
-        //   }
-        // }
-        // memcpy(info->buffer, (const void*) camBuf, camSize);
-        
-        // xSemaphoreGive( frameSync );
-
-        // sprintf(buf, "%d\r\n\r\n", currentSize);
-        // info->client->flush();
-        // info->client->write(CTNTTYPE, cntLen);
-        // info->client->write(buf, strlen(buf));
-        // info->client->write((char*) info->buffer, currentSize);
-        // info->client->write(BOUNDARY, bdrLen);
-// */
-
-//  ======================== OPTION2 ==================================
-//  just server the comman buffer protected by mutex
-// /*
         sprintf(buf, "%d\r\n\r\n", camSize);
         info->client->write(CTNTTYPE, cntLen);
         info->client->write(buf, strlen(buf));

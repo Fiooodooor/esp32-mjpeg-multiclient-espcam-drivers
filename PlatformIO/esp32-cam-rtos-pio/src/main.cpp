@@ -5,7 +5,7 @@
 
 #include "credentials.h"
 #include "streaming.h"
-
+#include "tft_viewer_config.h"
 const char *c_ssid = AP_SSID;
 const char *c_pwd = AP_PWD;
 
@@ -22,7 +22,7 @@ uint8_t      noActiveClients;   // number of active clients
 
 // frameSync semaphore is used to prevent streaming buffer as it is replaced with the next frame
 SemaphoreHandle_t frameSync = NULL;
-
+LGFX  tft;
 
 // ==== SETUP method ==================================================================
 void setup() {
@@ -39,6 +39,7 @@ void setup() {
   Log.trace("setup: total psram : %d\n", ESP.getPsramSize());
   Log.trace("setup: free psram  : %d\n", ESP.getFreePsram());
 
+// ---- Display driver ----
   // Release camera from power-down if PWDN is on GPIO48 (common on ESP32-S3 CAM boards)
   static camera_config_t camera_config = {
     .pin_pwdn       = PWDN_GPIO_NUM,
@@ -79,7 +80,7 @@ void setup() {
     Log.fatal("setup: Error initializing the camera\n");
     delay(10000);
     ESP.restart();
-  }
+  } 
 
 #if defined (FLIP_VERTICALLY)
   sensor_t* s = esp_camera_sensor_get();
@@ -98,6 +99,7 @@ void setup() {
   wm.setConfigPortalTimeout(180); // seconds
   wm.setConnectTimeout(45);
   wm.setConnectRetries(3);
+  tft.setupTft();
 
   strcpy(apname, c_ssid);
   strcpy(passwd, c_pwd);
@@ -126,5 +128,7 @@ void setup() {
 }
 
 void loop() {
-  vTaskDelete(NULL);
+  tft.pollSerial();
+  tft.frameReceiveTask();
+  
 }

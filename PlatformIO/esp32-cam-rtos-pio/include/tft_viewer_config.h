@@ -36,7 +36,7 @@
 #define TFT_SCLK 14
 #define TFT_CS 15
 #define TFT_DC 2
-#define TFT_RST -1
+#define TFT_RST 32
 
 // ---- Constants ----
 enum : uint32_t {
