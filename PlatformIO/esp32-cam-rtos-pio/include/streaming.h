@@ -24,6 +24,8 @@ void handleJPGSstream(void);
 void handleNotFound(void);
 void streamCB(void * pvParameters);
 void mjpegCB(void * pvParameters);
+void handleSetConfig(void);
+void handleGetConfig(void);
 
 #define FAIL_IF_OOM true
 #define OK_IF_OOM   false

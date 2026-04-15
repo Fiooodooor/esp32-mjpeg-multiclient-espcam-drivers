@@ -1,12 +1,11 @@
 /*
- * ESP32-S3 MJPEG Viewer — Performance-Optimized Streaming Client
+ * ESP32 MJPEG Viewer — CVBS Composite Video Output
  *
  * Core 0: WiFi download (PS off, bulk header parse, taskYIELD I/O)
- * Core 1: JPEG decode → ILI9488 480x320 TFT via 60 MHz SPI DMA
- * Double-buffered JPEG in PSRAM, producer-consumer semaphores
+ * Core 1: JPEG decode → CVBS output scaled to 480x320 via DAC (GPIO25/26)
+ * Double-buffered MJPEG download with a 1/4-sized CVBS canvas memory footprint.
  *
  * Serial: SET host:port/path | STATUS | RESET
- * Touch: tap to toggle OSD
  */
 
 #include <Arduino.h>
@@ -16,7 +15,8 @@
 #include <freertos/queue.h>
 #include <Preferences.h>
 #include <esp_wifi.h>
-#include "viewer_config.h"
+#include <esp_heap_caps.h>
+#include "cvbs_viewer/viewer_cvbs_config.h"
 
 // ---- Build-time defaults (override via -D flags) ----
 #ifndef VIEWER_WIFI_SSID
@@ -26,7 +26,7 @@
 #define VIEWER_WIFI_PASS  "wifi2da2875277"
 #endif
 #ifndef VIEWER_STREAM_HOST
-#define VIEWER_STREAM_HOST "192.168.1.100"
+#define VIEWER_STREAM_HOST "192.168.50.86"
 #endif
 #ifndef VIEWER_STREAM_PORT
 #define VIEWER_STREAM_PORT 80
@@ -37,9 +37,9 @@
 
 // ---- Constants ----
 enum : uint32_t {
-    MAX_JPEG_BUF   = 120 * 1024,
-    NUM_BUFS       = 3,
-    DL_STACK       = 12 * 1024,
+    MAX_JPEG_BUF   = 24 * 1024,
+    NUM_BUFS       = 2,
+    DL_STACK       = 16 * 1024,
     CONN_TIMEOUT   = 5000,
     READ_TIMEOUT   = 10000,
     BACKOFF_INIT   = 500,
@@ -48,13 +48,8 @@ enum : uint32_t {
     STATS_INTERVAL = 3000,
     FRAME_TIMEOUT  = 5000,
     HDR_BUF        = 512,
-    W = 480, H = 320,
-};
-
-// ---- Frame descriptor for queue-based triple buffer ----
-struct FrameDesc {
-    uint8_t* buf;
-    size_t   len;
+    W = CFG_PANEL_WIDTH,
+    H = CFG_PANEL_HEIGHT,
 };
 
 // ---- Connection state machine ----
@@ -68,18 +63,28 @@ static const uint16_t ST_CLR[] = {
     TFT_RED, TFT_YELLOW, TFT_RED, TFT_YELLOW, TFT_GREEN
 };
 
+// ---- Frame descriptor for queue-based single buffer ----
+struct FrameDesc {
+    uint8_t* buf;
+    size_t   len;
+};
+
 // ---- Globals ----
-static LGFX     tft;
-static JPEGDEC  jpeg;
-static PerfTracker perf;
-static Preferences prefs;
+static LGFX            tft;
+static JPEGDEC         jpeg;
+static PerfTracker     perf;
+static Preferences     prefs;
+static WiFiClient      cli;
+TaskHandle_t dlTaskHandle = NULL;
 
 static uint8_t* jpegBuf[NUM_BUFS];
+// static uint8_t jpegBuf[NUM_BUFS][MAX_JPEG_BUF];
+
 static volatile size_t frameSize;
 
-// Triple-buffer queues: download pushes filled frames, display returns empty ones
-static QueueHandle_t freeQ  = nullptr;  // pool of free FrameDesc
-static QueueHandle_t readyQ = nullptr;  // filled frames awaiting display
+// Triple-buffer queues
+static QueueHandle_t freeQ  = nullptr;
+static QueueHandle_t readyQ = nullptr;
 
 static volatile uint32_t  totFrames  = 0;
 static volatile uint32_t  totErrors  = 0;
@@ -90,29 +95,13 @@ static volatile int8_t    rssi       = 0;
 static volatile bool      osdOn      = true;
 static uint32_t           bootTime   = 0;
 
-static char     cfgHost[64];
-static uint16_t cfgPort;
-static char     cfgPath[64];
+static char     cfgHost[32];
+static char     cfgPath[32];
+static uint16_t cfgPort = 80;
 
-// ---- Double-buffered bgr888 conversion for DMA overlap ----
-// Pre-converting swap565→bgr888 lets LovyanGFX take the no_convert fast path:
-// one DMA transfer per MCU block instead of 21-pixel chunked conversion.
-static lgfx::bgr888_t __attribute__((aligned(4))) bgr888A[2048];
-static lgfx::bgr888_t __attribute__((aligned(4))) bgr888B[2048];
-static lgfx::bgr888_t* bgr888Cur = bgr888A;
-
-// ---- JPEG decode callback — convert + async DMA push ----
+// ---- JPEG decode callback — direct CVBS framebuffer update ----
 static int onJpegDraw(JPEGDRAW* d) {
-    const int n = d->iWidth * d->iHeight;
-    const lgfx::swap565_t* src = (const lgfx::swap565_t*)d->pPixels;
-    lgfx::bgr888_t* dst = bgr888Cur;
-    for (int i = 0; i < n; i++) {
-        dst[i] = src[i];   // LovyanGFX's correct swap565→bgr888 conversion
-    }
-    // pushImageDMA: DMA sends from bgr888Cur while JPEGDEC decodes next block
-    tft.pushImageDMA(d->x, d->y, d->iWidth, d->iHeight, dst);
-    // Swap buffer so DMA reads current while next callback writes to other
-    bgr888Cur = (bgr888Cur == bgr888A) ? bgr888B : bgr888A;
+    tft.pushImageDMA(d->x, d->y, d->iWidth, d->iHeight, (lgfx::swap565_t*)d->pPixels);
     return 1;
 }
 
@@ -162,7 +151,7 @@ static int parsePartHeader(WiFiClient& c, size_t& clen, uint8_t* jbuf) {
         hdr[pos] = 0;
         char* end = strstr(hdr, "\r\n\r\n");
         if (end) {
-            *end = 0; // limit search to header portion
+            *end = 0;
             char* cl = strstr(hdr, "ength:");
             if (!cl) cl = strstr(hdr, "ENGTH:");
             if (cl) clen = strtoul(cl + 6, nullptr, 10);
@@ -197,7 +186,6 @@ static void ensureWiFi() {
 
 // ---- Download task (Core 0) ----
 static void dlTask(void*) {
-    WiFiClient cli;
     cli.setNoDelay(true);
     cli.setTimeout(READ_TIMEOUT / 1000);
     uint32_t bo = BACKOFF_INIT;
@@ -224,100 +212,87 @@ static void dlTask(void*) {
             Serial.println("[DL] Streaming");
         }
 
-        // Get a free buffer (blocks only if all 3 are full — display backpressure)
         FrameDesc fd;
         if (xQueueReceive(freeQ, &fd, pdMS_TO_TICKS(FRAME_TIMEOUT)) != pdTRUE) {
             droppedFr++;
             continue;
         }
 
-        // Read JPEG into buffer WHILE display renders previous frame
         size_t clen;
         int pre = parsePartHeader(cli, clen, fd.buf);
         if (pre < 0) {
-            xQueueSend(freeQ, &fd, 0);  // return buffer
+            xQueueSend(freeQ, &fd, 0);
             if (!cli.connected()) { connSt = S_NO_STREAM; cli.stop(); }
             continue;
         }
 
         if ((size_t)pre < clen && !netReadExact(cli, fd.buf + pre, clen - pre)) {
-            xQueueSend(freeQ, &fd, 0);  // return buffer
+            xQueueSend(freeQ, &fd, 0);
             totErrors++;
             connSt = S_NO_STREAM;
             cli.stop();
             continue;
         }
 
-        // Post filled frame for display (if full, drop oldest)
         fd.len = clen;
         totFrames++;
         if (xQueueSend(readyQ, &fd, 0) != pdTRUE) {
-            // Queue full — drop this frame, return buffer
             droppedFr++;
             xQueueSend(freeQ, &fd, 0);
         }
     }
 }
 
+static void printMemInfo() {
+    Serial.printf("PSRAM=%u HeapInt=%u HInt_max=%u HeapDef=%u HDef_max=%u\n", ESP.getFreePsram(), heap_caps_get_free_size(MALLOC_CAP_INTERNAL), heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+    heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+}
+
 // ---- OSD ----
 static void drawOSD() {
     if (!osdOn) return;
-    // Bottom bar
-    tft.fillRect(0, H - 16, W, 16, TFT_BLACK);
+    // tft.fillRect(0, H - 16, W, 16, TFT_BLACK);
     tft.setTextSize(1);
-    tft.setTextDatum(bottom_left);
+    tft.setTextDatum(top_left);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.setCursor(2, H - 2);
-    tft.printf("%.1ffps %uKB dec:%.0fms", perf.fps, (unsigned)(frameSize/1024), perf.decodeMs);
-
-    tft.setTextDatum(bottom_center);
+    tft.setCursor(0, 2);
+    tft.printf("%.1ffps", perf.fps);
+    tft.setTextSize(1);
+    tft.setTextDatum(top_right);
     tft.setTextColor(ST_CLR[connSt], TFT_BLACK);
-    tft.drawString(ST_STR[connSt], W / 2, H - 2);
-
-    tft.setTextDatum(bottom_right);
-    tft.setTextColor(rssi > -60 ? TFT_GREEN : (rssi > -75 ? TFT_YELLOW : TFT_RED), TFT_BLACK);
-    tft.setCursor(W - 2, H - 2);
-    uint32_t up = (millis() - bootTime) / 1000;
-    tft.printf("R:%d fr:%u %02u:%02u", rssi, (unsigned)totFrames, up / 60, up % 60);
+    tft.setCursor(W/2, 2);
+    tft.printf("%s", ST_STR[connSt]);
 }
 
-static void drawSplash(const char* msg, uint16_t clr) {
+static void drawSplash(const char* msg, uint16_t title_clr, uint16_t msg_clr = TFT_WHITE) {
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(middle_center);
-    tft.setTextColor(clr, TFT_BLACK);
+    tft.setTextColor(title_clr, TFT_BLACK);
     tft.setTextSize(2);
     tft.drawString("MJPEG Viewer", W / 2, H / 2 - 30);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(msg_clr, TFT_BLACK);
     tft.drawString(msg, W / 2, H / 2 + 5);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     char u[96]; snprintf(u, sizeof(u), "%s:%d%s", cfgHost, cfgPort, cfgPath);
     tft.drawString(u, W / 2, H / 2 + 25);
 }
 
-// ---- Touch (throttled: every 8th frame) ----
-static void checkTouch() {
-    static uint8_t skip = 0;
-    if (++skip < 8) return;
-    skip = 0;
-    int32_t x, y;
-    if (tft.getTouch(&x, &y)) {
-        while (tft.getTouch(&x, &y)) vTaskDelay(pdMS_TO_TICKS(10));
-        osdOn = !osdOn;
-        if (!osdOn) { tft.fillRect(0, H-16, W, 16, TFT_BLACK); tft.fillRect(0, 0, 160, 12, TFT_BLACK); }
-    }
-}
-
 // ---- NVS config persistence ----
 static void cfgLoad() {
-    prefs.begin("v", true);
+    if (!prefs.begin("v", true)) {
+        strlcpy(cfgHost, VIEWER_STREAM_HOST, sizeof(cfgHost));
+        cfgPort = VIEWER_STREAM_PORT;
+        strlcpy(cfgPath, VIEWER_STREAM_PATH, sizeof(cfgPath));
+        return;
+    }
     strlcpy(cfgHost, prefs.getString("h", VIEWER_STREAM_HOST).c_str(), sizeof(cfgHost));
     cfgPort = prefs.getUShort("p", VIEWER_STREAM_PORT);
     strlcpy(cfgPath, prefs.getString("u", VIEWER_STREAM_PATH).c_str(), sizeof(cfgPath));
     prefs.end();
 }
 static void cfgSave() {
-    prefs.begin("v", false);
+    if (!prefs.begin("v", false)) return;
     prefs.putString("h", cfgHost);
     prefs.putUShort("p", cfgPort);
     prefs.putString("u", cfgPath);
@@ -337,7 +312,6 @@ static void pollSerial() {
             serialPos = 0;
 
             if (strncmp(serialBuf, "SET ", 4) == 0) {
-                // Parse host:port/path
                 char* col = strchr(serialBuf + 4, ':');
                 char* sl  = strchr(serialBuf + 4, '/');
                 if (col && sl && sl > col) {
@@ -363,7 +337,7 @@ static void pollSerial() {
                 prefs.begin("v", false); prefs.clear(); prefs.end();
                 ESP.restart();
             } else {
-                Serial.println("SET host:port/path | STATUS | RESET | HELP");
+                Serial.println("SET host:port/path | STATUS | RESET");
             }
         } else if (serialPos < sizeof(serialBuf) - 1) {
             serialBuf[serialPos++] = c;
@@ -376,26 +350,54 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     bootTime = millis();
-    Serial.println("\n=== ESP32-S3 MJPEG Viewer ===");
-    Serial.printf("Heap: %u  PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    Serial.println("\n=== ESP32 MJPEG Viewer (CVBS) ===");
+    printMemInfo();
 
     cfgLoad();
     Serial.printf("Target: %s:%d%s\n", cfgHost, cfgPort, cfgPath);
 
-    tft.init();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
-    tft.setSwapBytes(true);
-    drawSplash("Connecting WiFi...", TFT_CYAN);
-
-    // PSRAM triple buffers
+    // JPEG buffers for producer/consumer download + decode
     for (int i = 0; i < NUM_BUFS; i++) {
-        jpegBuf[i] = (uint8_t*)ps_malloc(MAX_JPEG_BUF);
+        jpegBuf[i] = (uint8_t*)heap_caps_malloc(MAX_JPEG_BUF, MALLOC_CAP_DEFAULT);
         if (!jpegBuf[i]) {
-            Serial.println("FATAL: PSRAM alloc failed");
-            drawSplash("PSRAM FAILED", TFT_RED);
+            jpegBuf[i] = (uint8_t*)heap_caps_malloc(MAX_JPEG_BUF, MALLOC_CAP_INTERNAL);
+        }
+    }
+    tft.setColorDepth(16);
+    tft.init();
+    tft.fillScreen(TFT_BLACK);
+    tft.setSwapBytes(false);
+
+    for (int i = 0; i < NUM_BUFS; i++)
+    {
+        if (!jpegBuf[i]) {
+            Serial.printf("FATAL: DRAM alloc failed (%u bytes)\n", MAX_JPEG_BUF);
+            drawSplash("MEMORY FAILED", TFT_RED, TFT_RED);
+            printMemInfo();
             for (;;) vTaskDelay(1000);
         }
+    }
+
+    drawSplash("Connecting WiFi...", TFT_CYAN, TFT_WHITE);
+    connSt = S_WIFI_UP;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(VIEWER_WIFI_SSID, VIEWER_WIFI_PASS);
+    for (int i = 0; i < 150 && WiFi.status() != WL_CONNECTED; i++) delay(100);
+
+    Serial.printf("Target frame: %ux%u\n", W, H);
+    printMemInfo();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        rssi = WiFi.RSSI();
+        Serial.printf("WiFi OK %s RSSI=%d ps=off\n", WiFi.localIP().toString().c_str(), rssi);
+        connSt = S_NO_STREAM;
+        drawSplash("WiFi OK", TFT_GREEN);
+    } else {
+        Serial.println("WiFi failed — will retry");
+        connSt = S_WIFI_DOWN;
+        drawSplash("WiFi retry...", TFT_YELLOW);
     }
 
     freeQ  = xQueueCreate(NUM_BUFS, sizeof(FrameDesc));
@@ -405,69 +407,52 @@ void setup() {
         xQueueSend(freeQ, &fd, 0);
     }
 
-    // WiFi
-    connSt = S_WIFI_UP;
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(VIEWER_WIFI_SSID, VIEWER_WIFI_PASS);
-    for (int i = 0; i < 150 && WiFi.status() != WL_CONNECTED; i++) delay(100);
-
-    if (WiFi.status() == WL_CONNECTED) {
-        esp_wifi_set_ps(WIFI_PS_NONE);
-        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
-        rssi = WiFi.RSSI();
-        Serial.printf("WiFi OK %s RSSI=%d ps=off bw=HT40\n", WiFi.localIP().toString().c_str(), rssi);
-        connSt = S_NO_STREAM;
-        drawSplash("WiFi OK", TFT_GREEN);
+    if(esp_task_wdt_init(WDT_TIMEOUT_SEC, false) == ESP_OK) {
+        printMemInfo();
+        Serial.println("esp_task_wdt_init ESP_OK. Starting download task...");
+        BaseType_t xReturned = xTaskCreatePinnedToCore(dlTask, "dl", DL_STACK, nullptr, 3, &dlTaskHandle, 0);
+        if(xReturned == pdPASS) {
+            Serial.println("xTaskCreatePinnedToCore pdPASS. Commands: SET host:port/path | STATUS | RESET");
+        } else {
+            Serial.printf("Failed to start download task. (code = %ld)\n", (long)xReturned);
+            printMemInfo();
+            drawSplash("DL Task Failed", TFT_RED);
+            for (;;) vTaskDelay(1000);
+        }
     } else {
-        Serial.println("WiFi failed — will retry");
-        connSt = S_WIFI_DOWN;
-        drawSplash("WiFi retry...", TFT_YELLOW);
+        Serial.println("Failed to initialize WDT");
+        drawSplash("WDT Failed", TFT_RED);
+        for (;;) vTaskDelay(1000);
     }
-
-    esp_task_wdt_init(WDT_TIMEOUT_SEC, false);
-    xTaskCreatePinnedToCore(dlTask, "dl", DL_STACK, nullptr, 3, nullptr, 0);
-    Serial.println("Ready. Commands: SET host:port/path | STATUS | RESET");
 }
 
 // ---- Main loop: decode & display (Core 1) ----
 void loop() {
     pollSerial();
-    checkTouch();
 
     FrameDesc fd;
     if (xQueueReceive(readyQ, &fd, pdMS_TO_TICKS(FRAME_TIMEOUT)) == pdTRUE) {
         frameSize = fd.len;
         uint32_t t0 = micros();
-        tft.startWrite();
         if (jpeg.openRAM(fd.buf, fd.len, onJpegDraw)) {
+            tft.startWrite();
             jpeg.setPixelType(RGB565_BIG_ENDIAN);
-            jpeg.decode(0, 0, 0);
+            int opts = JPEG_SCALE_HALF;
+            if (jpeg.getWidth() >= W * 2 && jpeg.getHeight() >= H * 2) {
+                opts = JPEG_SCALE_HALF;
+            }
+            jpeg.decode(0, 0, opts);
+            drawOSD();
+            tft.endWrite();
             jpeg.close();
         }
-        tft.waitDMA();   // ensure last MCU block DMA completes
-        tft.endWrite();
         perf.frameDone(micros() - t0);
-        xQueueSend(freeQ, &fd, 0);  // return buffer immediately
-
-        // OSD after buffer release — DL starts next frame in parallel
-        static uint8_t fpsSkip = 0;
-        if (osdOn && ++fpsSkip >= 4) {
-            fpsSkip = 0;
-            tft.setTextDatum(top_left); tft.setTextSize(1);
-            tft.setTextColor(TFT_GREEN, TFT_BLACK);
-            tft.setCursor(2, 2);
-            tft.printf("%.1ffps %uKB", perf.fps, (unsigned)(frameSize / 1024));
-        }
-        static uint32_t lastOSD = 0;
-        if (osdOn && millis() - lastOSD > OSD_INTERVAL) { drawOSD(); lastOSD = millis(); }
+        xQueueSend(freeQ, &fd, 0);
 
         static uint32_t lastLog = 0;
         if (millis() - lastLog > STATS_INTERVAL) {
-            Serial.printf("[D] %.1ffps fr=%u e=%u dec=%u-%u-%ums heap=%u\n",
-                perf.fps, totFrames, totErrors,
-                (unsigned)perf.minDecode, (unsigned)perf.decodeMs, (unsigned)perf.maxDecode,
-                ESP.getFreeHeap());
+            Serial.printf("[D] %.1ffps fr=%u e=%u dec=%u-%u-%ums heap=%u fsize=%u \n", perf.fps, totFrames, totErrors, (unsigned)perf.minDecode, (unsigned)perf.decodeMs, (unsigned)perf.maxDecode, ESP.getFreeHeap(), heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+            printMemInfo();
             lastLog = millis();
         }
     } else {

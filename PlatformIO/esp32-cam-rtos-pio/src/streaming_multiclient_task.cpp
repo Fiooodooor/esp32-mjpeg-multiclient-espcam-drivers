@@ -13,13 +13,8 @@ uint32_t lastPrintCam = millis();
 #endif
 
 void camCB(void* pvParameters) {
-
   TickType_t xLastWakeTime;
-
-  //  A running interval associated with currently desired frame rate
   const TickType_t xFrequency = pdMS_TO_TICKS(1000 / FPS);
-
-  //  Pointers to the 2 frames, their respective sizes and index of the current frame
   char* fbs[2] = { NULL, NULL };
   size_t fSize[2] = { 0, 0 };
   int ifb = 0;
@@ -55,7 +50,7 @@ void camCB(void* pvParameters) {
     }
     else {
       Log.error("camCB: error capturing image for frame %d\n", frameNumber);
-      vTaskDelay(1000);
+      vTaskDelay(10);
     }
 
 #if defined(BENCHMARK)
@@ -66,8 +61,6 @@ void camCB(void* pvParameters) {
     //  Wait on a semaphore until client operation completes
     //    xSemaphoreTake( frameSync, portMAX_DELAY );
 
-    //  Do not allow frame copying while switching the current frame
-    // if ( xSemaphoreTake( frameSync, xFrequency ) ) {
     if ( xSemaphoreTake( frameSync, portMAX_DELAY ) ) {
       camBuf = fbs[ifb];
       camSize = s;
@@ -81,9 +74,6 @@ void camCB(void* pvParameters) {
     //  Let other (streaming) tasks run
     if ( xTaskDelayUntil(&xLastWakeTime, xFrequency) != pdTRUE ) taskYIELD();
 
-    //  If streaming task has suspended itself (no active clients to stream to)
-    //  there is no need to grab frames from the camera. We can save some juice
-    //  by suspedning the tasks
     if ( noActiveClients == 0 ) {
       Log.verbose("mjpegCB: free heap           : %d\n", ESP.getFreeHeap());
       Log.verbose("mjpegCB: min free heap)      : %d\n", ESP.getMinFreeHeap());
@@ -91,15 +81,12 @@ void camCB(void* pvParameters) {
       Log.verbose("mjpegCB: tCam stack wtrmark  : %d\n", uxTaskGetStackHighWaterMark(tCam));
       vTaskSuspend(NULL);  // passing NULL means "suspend yourself"
     }
-
 #if defined(BENCHMARK)
     if ( millis() - lastPrintCam > BENCHMARK_PRINT_INT ) {
       lastPrintCam = millis();
       Log.verbose("mjpegCB: average frame capture time: %d microseconds\n", captureAvg.currentValue() );
     }
 #endif
-
-
   }
 }
 
@@ -134,7 +121,7 @@ void handleJPGSstream(void)
   int rc = xTaskCreatePinnedToCore(
              streamCB,
              "streamCB",
-             3 * KILOBYTE,
+             8 * KILOBYTE,
              (void*) info,
              tskIDLE_PRIORITY + 2,
              &info->task,
@@ -152,7 +139,6 @@ void handleJPGSstream(void)
   if ( eTaskGetState( tCam ) == eSuspended ) vTaskResume( tCam );
 }
 
-
 // ==== Actually stream content to all connected clients ========================
 void streamCB(void * pvParameters) {
   char buf[16];
@@ -167,7 +153,6 @@ void streamCB(void * pvParameters) {
     ESP.restart();
   }
 
-  
   xLastWakeTime = xTaskGetTickCount();
   xFrequency = pdMS_TO_TICKS(1000 / FPS);
   Log.trace("streamCB: Client Connected\n");
@@ -201,7 +186,7 @@ void streamCB(void * pvParameters) {
 #endif        
 
         xSemaphoreTake( frameSync, portMAX_DELAY );
-        size_t currentSize = camSize;
+        // size_t currentSize = camSize;
 
 #if defined (BENCHMARK)
         waitAvg.value(micros()-streamStart);
@@ -214,31 +199,31 @@ void streamCB(void * pvParameters) {
 //  server a copy of the buffer - overhead: have to allocate and copy a buffer for all frames
 
 // /*
-        if ( info->buffer == NULL ) {
-          info->buffer = allocateMemory (info->buffer, camSize, FAIL_IF_OOM, ANY_MEMORY);
-          info->len = camSize;
-        }
-        else {
-          if ( camSize > info->len ) {
-            info->buffer = allocateMemory (info->buffer, camSize, FAIL_IF_OOM, ANY_MEMORY);
-            info->len = camSize;
-          }
-        }
-        memcpy(info->buffer, (const void*) camBuf, camSize);
+        // if ( info->buffer == NULL ) {
+        //   info->buffer = allocateMemory (info->buffer, camSize, FAIL_IF_OOM, ANY_MEMORY);
+        //   info->len = camSize;
+        // }
+        // else {
+        //   if ( camSize > info->len ) {
+        //     info->buffer = allocateMemory (info->buffer, camSize, FAIL_IF_OOM, ANY_MEMORY);
+        //     info->len = camSize;
+        //   }
+        // }
+        // memcpy(info->buffer, (const void*) camBuf, camSize);
         
-        xSemaphoreGive( frameSync );
+        // xSemaphoreGive( frameSync );
 
-        sprintf(buf, "%d\r\n\r\n", currentSize);
-        info->client->flush();
-        info->client->write(CTNTTYPE, cntLen);
-        info->client->write(buf, strlen(buf));
-        info->client->write((char*) info->buffer, currentSize);
-        info->client->write(BOUNDARY, bdrLen);
+        // sprintf(buf, "%d\r\n\r\n", currentSize);
+        // info->client->flush();
+        // info->client->write(CTNTTYPE, cntLen);
+        // info->client->write(buf, strlen(buf));
+        // info->client->write((char*) info->buffer, currentSize);
+        // info->client->write(BOUNDARY, bdrLen);
 // */
 
 //  ======================== OPTION2 ==================================
 //  just server the comman buffer protected by mutex
-/*
+// /*
         sprintf(buf, "%d\r\n\r\n", camSize);
         info->client->write(CTNTTYPE, cntLen);
         info->client->write(buf, strlen(buf));
@@ -247,8 +232,7 @@ void streamCB(void * pvParameters) {
         xSemaphoreGive( frameSync );
 
         info->client->write(BOUNDARY, bdrLen);
-*/
-
+// */
 //  ====================================================================
         info->frame = frameNumber;
 #if defined (BENCHMARK)
@@ -269,7 +253,7 @@ void streamCB(void * pvParameters) {
       delete info;
       info = NULL;
       Log.trace("streamCB: Client disconnected\n");
-      vTaskDelay(100);
+      vTaskDelay(10);
       vTaskDelete(NULL);
     }
     //  Let other tasks run after serving every client

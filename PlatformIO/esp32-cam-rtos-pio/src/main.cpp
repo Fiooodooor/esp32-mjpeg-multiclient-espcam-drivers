@@ -1,19 +1,7 @@
-/*
 
-  This is a MJPEG streaming webserver implemented for AI-Thinker ESP32-CAM
-  and ESP-EYE modules.
-  This is tested to work with VLC and Blynk video widget and can support up to 10
-  simultaneously connected streaming clients.
-  Simultaneous streaming is implemented with FreeRTOS tools: queue and tasks.
-
-  Inspired by and based on this Instructable: $9 RTSP Video Streamer Using the ESP32-CAM Board
-  (https://www.instructables.com/id/9-RTSP-Video-Streamer-Using-the-ESP32-CAM-Board/)
-
-*/
-
+#include <Arduino.h>
 #include "definitions.h"
 #include "references.h"
-
 
 #include "credentials.h"
 #include "streaming.h"
@@ -21,12 +9,7 @@
 const char *c_ssid = AP_SSID;
 const char *c_pwd = AP_PWD;
 
-// Camera models overview:
-// https://randomnerdtutorials.com/esp32-cam-camera-pin-gpios/
-
-
 #include "camera_pins.h"
-
 WebServer server(80);
 
 // ===== rtos task handles =========================
@@ -56,6 +39,7 @@ void setup() {
   Log.trace("setup: total psram : %d\n", ESP.getPsramSize());
   Log.trace("setup: free psram  : %d\n", ESP.getFreePsram());
 
+  // Release camera from power-down if PWDN is on GPIO48 (common on ESP32-S3 CAM boards)
   static camera_config_t camera_config = {
     .pin_pwdn       = PWDN_GPIO_NUM,
     .pin_reset      = RESET_GPIO_NUM,
@@ -80,10 +64,10 @@ void setup() {
     .pixel_format   = PIXFORMAT_JPEG,
     .frame_size     = FRAME_SIZE,
     .jpeg_quality   = JPEG_QUALITY,
-    .fb_count       = 2,
-    .fb_location = CAMERA_FB_IN_DRAM,
+    .fb_count       = (FRAME_SIZE <= FRAMESIZE_SVGA) ? 2 : 1, // Use double buffering for smaller frames to improve performance
+    .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
-    // .sccb_i2c_port = -1
+    .sccb_i2c_port = -1
   };
 
 #if defined(CAMERA_MODEL_ESP_EYE)
@@ -107,13 +91,10 @@ void setup() {
   char passwd[65];
   IPAddress ip;
   WiFiManager wm;
-
-
   WiFi.setAutoConnect(true);
 
   std::vector<const char *> menu = {"wifi","restart","exit"};
   wm.setMenu(menu);
-
   wm.setConfigPortalTimeout(180); // seconds
   wm.setConnectTimeout(45);
   wm.setConnectRetries(3);
@@ -128,14 +109,14 @@ void setup() {
 
   ip = WiFi.localIP();
   Log.verbose(F("setup: WiFi connected\n"));
-  // Log.verbose("Stream Link: http://%S/mjpeg/1\n\n", ip.toString());
+  Log.verbose("Stream Link: http://%S/mjpeg/1\n\n", ip.toString());
   Serial.printf("Stream Link: http://%s%s\n\n", ip.toString().c_str(), STREAMING_URL);
 
   // Start main streaming RTOS task
   xTaskCreatePinnedToCore(
     mjpegCB,
     "mjpeg",
-    3 * KILOBYTE,
+    8 * KILOBYTE,
     NULL,
     tskIDLE_PRIORITY + 2,
     &tMjpeg,

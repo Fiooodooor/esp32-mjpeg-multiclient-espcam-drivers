@@ -1,4 +1,4 @@
 #pragma once
 
-#define AP_SSID "Akwa"
-#define AP_PWD  "wifi"
+#define AP_SSID "configurator"
+#define AP_PWD  "wifi2da2875277"

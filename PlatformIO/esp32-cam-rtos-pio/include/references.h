@@ -5,7 +5,7 @@
 #include "logging.h"
 
 #include "esp_camera.h"
-#include "ov2640.h"
+#include "ov5640.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiManager.h>
